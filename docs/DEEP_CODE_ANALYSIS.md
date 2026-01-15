@@ -269,42 +269,44 @@ def generateAssignment(
     loadMap: LoadMap): SliceMap[ProposedSliceAssignment]
 ```
 
-### 5.2 The Five Phases
+### 5.2 The Seven Phases
+
+The algorithm runs 7 phases in sequence. This is based on the Slicer paper but adapted for Kubernetes:
 
 ```scala
 // dicer/assigner/algorithm/src/AlgorithmExecutor.scala:56-78
 def run(config: Config, resources: Resources, assignment: MutableAssignment): Unit = {
-  // Phase 1: Remove slices from unhealthy pods
-  DeallocationPhase.deallocateUnhealthyResources(assignment)
-
-  // Phase 2: Clamp replica counts to min/max
-  ConstraintPhase.clampReplicas(config, assignment)
-
-  // Phase 3: Split hot slices
-  Splitter.splitHotSlices(config, assignment)
-
-  // Phase 4: Merge cold adjacent slices
-  MergePhase.merge(config, resources, assignment)
-
-  // Phase 5: Ensure minimum slice count
-  Splitter.ensureMinTotalSliceReplicas(resources, assignment)
-
-  // Phase 6: Greedy local search for optimal placement
-  PlacementPhase.place(config, assignment)
-
-  // Phase 7: Final merge pass (placement may have replicated)
-  MergePhase.merge(config, resources, assignment)
+  DeallocationPhase.deallocateUnhealthyResources(assignment)  // Phase 1
+  ConstraintPhase.clampReplicas(config, assignment)            // Phase 2
+  Splitter.splitHotSlices(config, assignment)                  // Phase 3
+  MergePhase.merge(config, resources, assignment)              // Phase 4
+  Splitter.ensureMinTotalSliceReplicas(resources, assignment)  // Phase 5
+  PlacementPhase.place(config, assignment)                     // Phase 6
+  MergePhase.merge(config, resources, assignment)              // Phase 7
 }
 ```
 
+**Phase Summary Table**:
+
+| Phase | Name | Slicer Step | Purpose |
+|-------|------|-------------|---------|
+| 1 | Deallocation | Step 1 | Remove slices from unhealthy pods |
+| 2 | Constraint | Step 2 | Clamp replica counts to min/max |
+| 3 | Split Hot | Step 5(a) | Split slices exceeding load threshold |
+| 4 | Merge | Step 3(a) | Merge cold adjacent slices |
+| 5 | Split Min | - | Ensure minimum total slice replicas |
+| 6 | Placement | Step 4 | Greedy local search for balance |
+| 7 | Final Merge | - | Clean up after placement replication |
+
 ### 5.3 Phase 1: Deallocation
 
-Simplest phase - remove all slices from unhealthy resources:
+The simplest phase - remove all slices from unhealthy resources:
 
 ```scala
 // dicer/assigner/algorithm/src/DeallocationPhase.scala:10-22
 def deallocateUnhealthyResources(assignment: MutableAssignment): Unit = {
   for (unhealthyResource <- assignment.getUnhealthyResourceStates) {
+    // Capture to Vector to avoid iterator invalidation during modification
     val assignedSlices = unhealthyResource.getAssignedSlices.toVector
     for (sliceAssignment <- assignedSlices) {
       sliceAssignment.deallocateResource(unhealthyResource)
@@ -313,7 +315,128 @@ def deallocateUnhealthyResources(assignment: MutableAssignment): Unit = {
 }
 ```
 
-### 5.4 Phase 6: Placement (The Heart of the Algorithm)
+**Key insight**: This phase runs first to ensure subsequent phases don't consider unhealthy resources.
+
+### 5.4 Phase 2: Constraint
+
+Clamp replica counts to configured bounds before split/merge decisions:
+
+```scala
+// dicer/assigner/algorithm/src/ConstraintPhase.scala:11-23
+def clampReplicas(config: Config, assignment: MutableAssignment): Unit = {
+  val minReplicas = config.resourceAdjustedKeyReplicationConfig.minReplicas
+  val maxReplicas = config.resourceAdjustedKeyReplicationConfig.maxReplicas
+
+  for (sliceAssignment <- assignment.sliceAssignmentsIterator) {
+    val current = sliceAssignment.currentNumReplicas
+    val clamped = current.max(minReplicas).min(maxReplicas)
+    sliceAssignment.adjustReplicas(clamped)
+  }
+}
+```
+
+**Why early?** Split/merge phases need accurate per-replica load values. Clamping first ensures they compute correctly.
+
+### 5.5 Phase 3: Split Hot Slices
+
+Split slices whose per-replica load exceeds the split threshold:
+
+```scala
+// dicer/assigner/algorithm/src/Splitter.scala:16-22
+def splitHotSlices(config: Config, assignment: MutableAssignment): Unit = {
+  splitInternal(
+    assignment,
+    minSliceReplicas = Int.MaxValue,  // No minimum target
+    splitThreshold = config.desiredLoadRange.splitThreshold
+  )
+}
+```
+
+**The Split Loop**:
+```scala
+// dicer/assigner/algorithm/src/Splitter.scala:48-82
+private def splitInternal(...): Unit = {
+  // Priority queue ordered by per-replica load (hottest first)
+  val remainingCandidates = PriorityQueue.empty(sliceAsnOrderingByRawLoadPerReplica)
+  remainingCandidates ++= assignment.sliceAssignmentsIterator
+
+  while (remainingCandidates.nonEmpty &&
+         assignment.currentNumTotalSliceReplicas < minSliceReplicas) {
+    val hottest = remainingCandidates.dequeue()
+
+    if (hottest.rawLoadPerReplica <= splitThreshold) {
+      return  // All remaining are below threshold
+    }
+
+    hottest.split() match {
+      case Some((left, right)) =>
+        // Both children inherit parent's resources (zero churn)
+        remainingCandidates.enqueue(left, right)
+      case None =>
+        // Unsplittable (single-keyed slice)
+    }
+  }
+}
+```
+
+**Why split before replicate?** Splitting maintains affinity (same pod handles same keys), while replication spreads keys across pods. Prefer affinity when possible.
+
+### 5.6 Phase 4: Merge Cold Slices
+
+Merge adjacent cold slices to keep total replicas below the maximum:
+
+```scala
+// dicer/assigner/algorithm/src/MergePhase.scala:21-23
+def merge(config: Config, resources: Resources, assignment: MutableAssignment): Unit = {
+  new Merger(config, resources, assignment).run()
+}
+```
+
+**The Merge Algorithm** uses an intrusive min-heap for efficiency:
+
+```scala
+// dicer/assigner/algorithm/src/MergePhase.scala:147-159
+def run(): Unit = {
+  val maxSliceReplicas = MAX_AVG_SLICE_REPLICAS * resources.availableResources.size
+
+  if (assignment.currentNumTotalSliceReplicas <= maxSliceReplicas) {
+    return  // Already within bounds
+  }
+
+  populateCandidates()  // All adjacent slice pairs
+
+  while (assignment.currentNumTotalSliceReplicas > maxSliceReplicas &&
+         candidates.nonEmpty) {
+    val coldestPair = candidates.pop()  // Lowest combined load
+    coldestPair.merge()
+  }
+}
+```
+
+**Key data structure**: `CandidateSlicePair` maintains predecessor/successor links so that after merging `[b,c) + [c,d)` into `[b,d)`, the adjacent candidates `[a,b)-[b,d)` and `[b,d)-[d,e)` can be efficiently updated.
+
+**Invariant**: Merged slices always get minimum replicas (cold pairs don't need more).
+
+### 5.7 Phase 5: Ensure Minimum Slice Replicas
+
+Zero-churn splits to meet the minimum total replica count:
+
+```scala
+// dicer/assigner/algorithm/src/Splitter.scala:33-39
+def ensureMinTotalSliceReplicas(resources: Resources, assignment: MutableAssignment): Unit = {
+  splitInternal(
+    assignment,
+    minSliceReplicas = MIN_AVG_SLICE_REPLICAS * resources.availableResources.size,
+    splitThreshold = -1.0  // Negative = split regardless of load
+  )
+}
+```
+
+**Why needed?** Phases 2-4 (constraint clamping, merging) may have reduced replicas below the minimum. This phase restores the invariant.
+
+**Zero-churn**: Both child slices inherit parent's resource assignments. Hot slices are still prioritized for splits (benefits placement phase).
+
+### 5.8 Phase 6: Placement (The Heart of the Algorithm)
 
 Placement uses **greedy local search** to minimize an objective function:
 
@@ -327,20 +450,32 @@ Placement uses **greedy local search** to minimize an objective function:
 
 | Penalty | Formula | Coefficient | Purpose |
 |---------|---------|-------------|---------|
-| Churn | `churnConfig.maxPenaltyRatio * slice_per_replica_load` | ~0.25 | Discourage movement |
-| Undershoot | `(1 + (min - load)/min)^2 * (min - load) * 4.0` | 4.0 | Fill underloaded pods |
-| Overshoot | `(load/max)^2 * (load - max) * 16.0` | 16.0 | Prevent overload |
+| Churn | `maxPenaltyRatio * slice_per_replica_load` | ~0.25 | Discourage movement |
+| Undershoot | `(1 + (min - load)/min)² * (min - load)` | 4.0 | Fill underloaded pods |
+| Overshoot | `(load/max)² * (load - max)` | 16.0 | Prevent overload |
 | Empty | `max_desired_load * 100` | 100.0 | Never leave pods empty |
 | Replication | `current_per_replica_load` | 1.0 | Discourage over-replication |
 
-**Operations**:
-1. **Reassign**: Move slice from hot pod to cold pod
-2. **Replicate**: Add another replica of a slice
-3. **Dereplicate**: Remove a replica
+**Why these coefficients?**
+- Overshoot (16.0) > Undershoot (4.0): Overload is more dangerous than underutilization
+- Empty (100.0) dominates: Guarantees no pod is left without slices
+- Churn (~0.25) is low: Willing to move for balance, but not excessively
+
+**Three Operations**:
+
+| Operation | Effect | When Used |
+|-----------|--------|-----------|
+| Reassign | Move slice from hot to cold pod | Most common |
+| Replicate | Add replica on cold pod | Hot slice can't be split further |
+| Dereplicate | Remove replica from hot pod | Above minimum replicas |
+
+**The Greedy Loop**:
 
 ```scala
-// dicer/assigner/algorithm/src/PlacementPhase.scala:94-153
+// dicer/assigner/algorithm/src/PlacementPhase.scala:95-153
 def run(): Unit = {
+  val deadline = PLACEMENT_TIMEOUT.fromNow  // 30 seconds max
+
   while (assignment.eligibleResourcesRemain && deadline.hasTimeLeft()) {
     val hottestResource = assignment.hottestResourceState
     val candidateOps = generateCandidateOperations(hottestResource)
@@ -359,13 +494,27 @@ def run(): Unit = {
     if (bestOp.isDefined && bestDelta < -1e-10) {
       applyOperation(bestOp.get)
     } else {
-      hottestResource.exclude()  // Can't improve, try next
+      hottestResource.exclude()  // Can't improve, try next hottest
     }
   }
 }
 ```
 
-### 5.5 Slice Count Invariants
+**Termination conditions**:
+1. No eligible resources remain (all excluded)
+2. 30-second timeout reached
+3. No improving operation found for any resource
+
+### 5.9 Phase 7: Final Merge
+
+The placement phase may replicate slices, pushing total replicas above the maximum. This final merge pass cleans up:
+
+```scala
+// Same as Phase 4, but typically a no-op
+MergePhase.merge(config, resources, assignment)
+```
+
+### 5.10 Slice Count Invariants
 
 The algorithm maintains these bounds:
 
