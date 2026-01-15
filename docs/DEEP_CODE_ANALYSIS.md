@@ -298,8 +298,6 @@ def run(config: Config, resources: Resources, assignment: MutableAssignment): Un
 | 6 | Placement | Greedy local search for balance |
 | 7 | Final Merge | Clean up after placement replication |
 
-> **Note**: The code comments in `AlgorithmExecutor.scala` reference the Slicer paper's algorithm steps (e.g., "like step 5(a) of Slicer"). Those refer to Figure 2 in the [Slicer OSDI 2016 paper](https://www.usenix.org/system/files/conference/osdi16/osdi16-adya.pdf), not to anything in the Dicer codebase. The Dicer algorithm is inspired by Slicer but differs in implementation details.
-
 ### 5.3 Phase 1: Deallocation
 
 The simplest phase - remove all slices from unhealthy resources:
