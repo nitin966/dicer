@@ -288,15 +288,17 @@ def run(config: Config, resources: Resources, assignment: MutableAssignment): Un
 
 **Phase Summary Table**:
 
-| Phase | Name | Slicer Step | Purpose |
-|-------|------|-------------|---------|
-| 1 | Deallocation | Step 1 | Remove slices from unhealthy pods |
-| 2 | Constraint | Step 2 | Clamp replica counts to min/max |
-| 3 | Split Hot | Step 5(a) | Split slices exceeding load threshold |
-| 4 | Merge | Step 3(a) | Merge cold adjacent slices |
-| 5 | Split Min | - | Ensure minimum total slice replicas |
-| 6 | Placement | Step 4 | Greedy local search for balance |
-| 7 | Final Merge | - | Clean up after placement replication |
+| Phase | Name | Purpose |
+|-------|------|---------|
+| 1 | Deallocation | Remove slices from unhealthy pods |
+| 2 | Constraint | Clamp replica counts to min/max |
+| 3 | Split Hot | Split slices exceeding load threshold |
+| 4 | Merge | Merge cold adjacent slices |
+| 5 | Split Min | Ensure minimum total slice replicas |
+| 6 | Placement | Greedy local search for balance |
+| 7 | Final Merge | Clean up after placement replication |
+
+> **Note**: The code comments in `AlgorithmExecutor.scala` reference the Slicer paper's algorithm steps (e.g., "like step 5(a) of Slicer"). Those refer to Figure 2 in the [Slicer OSDI 2016 paper](https://www.usenix.org/system/files/conference/osdi16/osdi16-adya.pdf), not to anything in the Dicer codebase. The Dicer algorithm is inspired by Slicer but differs in implementation details.
 
 ### 5.3 Phase 1: Deallocation
 
